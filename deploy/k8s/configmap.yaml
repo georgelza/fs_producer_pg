@@ -1,0 +1,32 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-producer-configmap
+  namespace: app
+data:
+  LOG_LEVEL: DEBUG
+  LOG_FORMAT: ""
+  DEBUGLEVEL: 2
+  TESTSIZE: 4000
+  SLEEP: 1000
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-configmap
+  namespace: app
+data:
+  kafka_topic_name: SNDBX_AppLab
+  kafka_security_protocol: SASL_SSL
+  kafka_sasl_mechanisms: PLAIN
+  kafka_num_partitions: 6
+  kafka_replication_factor: 1
+  kafka_retension: 3600
+  kafka_parseduration: 60s
+  # From secrets
+  #  kafka_bootstrap_servers: pkc-q283m.af-south-1.aws.confluent.cloud
+  #  kafka_bootstrap_port: 9092
+  #  kafka_sasl_username: "45OVXFWM6XNAULLA"
+  #  kafka_sasl_password: "caHMOdjuqR1tot28czh1cOXR0N00V+d2se+qZJV+8ZtnqKi0I1Pz5EjgWom17kc/"
