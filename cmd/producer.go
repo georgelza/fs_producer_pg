@@ -15,6 +15,10 @@
 *
 *	jsonformatter 	: https://jsonformatter.curiousconcept.com/#
 *
+*	For Prometheus	: https://www.youtube.com/watch?v=WUBjlJzI2a0
+*					: https://github.com/antonputra/tutorials/tree/main/lessons/137
+*					: https://www.youtube.com/watch?v=fhx0ehppMGM
+*
 *****************************************************************************/
 
 package main
@@ -25,7 +29,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"math/rand"
-	"net/http"
 	"os"
 	"strconv"
 	"time"
@@ -40,7 +43,7 @@ import (
 
 	// Prometheus
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/client_golang/prometheus/push"
 
 	// My Types/Structs/functions
 	"cmd/seed"
@@ -74,17 +77,24 @@ type tp_kafka struct {
 }
 
 type metrics struct {
-	info          *prometheus.GaugeVec
-	req_processed *prometheus.CounterVec
-	sql_duration  *prometheus.HistogramVec
-	rec_duration  *prometheus.HistogramVec
-	api_duration  *prometheus.HistogramVec
+	startTime      *prometheus.GaugeVec
+	completionTime *prometheus.GaugeVec
+	duration       *prometheus.HistogramVec
+	info           *prometheus.GaugeVec
+	sql_duration   *prometheus.HistogramVec
+	rec_duration   *prometheus.HistogramVec
+	api_duration   *prometheus.HistogramVec
+	req_processed  *prometheus.CounterVec
 }
 
 var (
 	grpcLog glog.LoggerV2
-	reg     = prometheus.NewRegistry()
-	m       = NewMetrics(reg)
+
+	reg = prometheus.NewRegistry()
+	// if you want the default prometheus metrics also
+	// reg.MustRegister(collectors.NewGoCollector())
+	m      = NewMetrics(reg)
+	pusher = push.New("http://localhost:9091", "pushgateway").Gatherer(reg)
 )
 
 func init() {
@@ -111,40 +121,56 @@ func init() {
 func NewMetrics(reg prometheus.Registerer) *metrics {
 
 	m := &metrics{
-		info: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		startTime: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "fs_etl_start_timestamp_seconds",
+			Help: "The timestamp of the last start of a FS ETL job.",
+		}, []string{"batch"}),
+
+		completionTime: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "fs_etl_competion_timestamp_seconds",
+			Help: "The timestamp of the last completion of a FS ETL job.",
+		}, []string{"batch"}),
+
+		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "fs_etl_duration_seconds",
+			Help:    "The complete batch duration time for FS ETL job in seconds.",
+			Buckets: []float64{0.001, 0.0015, 0.002, 0.0025, 0.01},
+		}, []string{"batch"}),
+
+		info: prometheus.NewGaugeVec(prometheus.GaugeOpts{ // Shows value, can go up and down
 			Name: "txn_count",
-			Help: "Target amount for completed requests",
+			Help: "The number of records discovered to be processed for FS ETL job",
 		}, []string{"batch"}),
 
-		req_processed: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "fs_etl_operations_count",
-			Help: "Number of completed requests.",
-		}, []string{"batch"}),
-
-		sql_duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		//
+		sql_duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{ // used to store timed values
 			Name: "fs_sql_duration_seconds",
-			Help: "Duration of the sql requests",
+			Help: "Duration of the FS ETL sql requests in seconds",
 			// 4 times larger apdex status
 			// Buckets: prometheus.ExponentialBuckets(0.1, 1.5, 5),
-			// Buckets: prometheus.LinearBuckets(0.1, 5, 5),
-			Buckets: []float64{0.1, 0.15, 0.2, 0.25, 0.3},
-		}, []string{"batch"}),
-
-		rec_duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name: "fs_etl_operations_seconds",
-			Help: "Duration of the entire requests",
-
-			Buckets: []float64{0.1, 0.15, 0.2, 0.25, 0.3},
+			// Buckets: prometheus.LinearBuckets(0.1, 5, 15),
+			Buckets: []float64{0.1, 0.5, 1, 5, 10, 100},
 		}, []string{"batch"}),
 
 		api_duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "fs_api_duration_seconds",
-			Help:    "Duration of the api requests",
-			Buckets: []float64{0.1, 0.15, 0.2, 0.25, 0.3},
+			Help:    "Duration of the FS ETL api requests in seconds",
+			Buckets: []float64{0.00001, 0.000015, 0.00002, 0.000025, 0.00003},
+		}, []string{"batch"}),
+
+		rec_duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "fs_etl_operations_seconds",
+			Help:    "Duration of the entire FS ETL requests in seconds",
+			Buckets: []float64{0.001, 0.0015, 0.002, 0.0025, 0.01},
+		}, []string{"batch"}),
+
+		req_processed: prometheus.NewCounterVec(prometheus.CounterOpts{ // can only go up/increment, but usefull combined with rate, resets to zero at restart.
+			Name: "fs_etl_operations_total",
+			Help: "The number of records processed for the FS ETL job.",
 		}, []string{"batch"}),
 	}
 
-	reg.MustRegister(m.info, m.req_processed, m.sql_duration, m.rec_duration, m.api_duration)
+	reg.MustRegister(m.startTime, m.completionTime, m.duration, m.info, m.sql_duration, m.api_duration, m.rec_duration, m.req_processed)
 
 	return m
 }
@@ -490,6 +516,12 @@ func fetchEFTRecords() (records []string, count int) {
 	// post to Prometheus
 	m.sql_duration.WithLabelValues("eft").Observe(time.Since(sTime).Seconds())
 
+	// Add is used here rather than Push to not delete a previously pushed
+	// success timestamp in case of a failure of this backup.
+	if err := pusher.Add(); err != nil {
+		fmt.Println("Could not push to Pushgateway:", err)
+	}
+
 	// Return pointer to recordset and counter of number of records
 	count = 4252345123
 
@@ -500,6 +532,15 @@ func fetchEFTRecords() (records []string, count int) {
 }
 
 func runEFTLoader() {
+
+	m.startTime.With(prometheus.Labels{"batch": "eft"}).SetToCurrentTime()
+
+	// Add is used here rather than Push to not delete a previously pushed
+	// success timestamp in case of a failure of this backup.
+	if err := pusher.Add(); err != nil {
+		fmt.Println("Could not push to Pushgateway:", err)
+	}
+	batchStartTime := time.Now()
 
 	// Initialize the vGeneral struct variable.
 	vGeneral := loadGeneralProps()
@@ -588,11 +629,17 @@ func runEFTLoader() {
 		// Lets fecth the records that need to be pushed to the fs api end point
 		returnedRecs, todo_count := fetchEFTRecords()
 
+		// As we're still faking it, otherwise this will be the value as returned from above.
+		todo_count = vGeneral.testsize
+
 		m.info.With(prometheus.Labels{"batch": "eft"}).Set(float64(todo_count)) // this will be the recordcount of the records returned by the sql query
 		println(returnedRecs)                                                   // just doing this to prefer a unused error
 
-		// As we're still faking it:
-		todo_count = vGeneral.testsize // this will be recplaced by the value of todo_count from above.
+		// Add is used here rather than Push to not delete a previously pushed
+		// success timestamp in case of a failure of this backup.
+		if err := pusher.Add(); err != nil {
+			fmt.Println("Could not push to Pushgateway:", err)
+		}
 
 		// now we loop through the results, building a json document based on FS requirements and then post it, for this code I'm posting to
 		// Confluent Kafka topic, but it's easy to change to have it post to a API endpoint.
@@ -840,7 +887,8 @@ func runEFTLoader() {
 
 				}
 				//determine the duration of the api call log to prometheus histogram
-				m.rec_duration.WithLabelValues("nrt_eft").Observe(time.Since(apiStart).Seconds())
+				m.api_duration.WithLabelValues("eft").Observe(time.Since(apiStart).Seconds())
+				//fmt.Printf("api_duration Execution time: %.7f s\n", time.Since(apiStart).Seconds())
 
 				//Fush every flush_interval loops
 				if vFlush == vKafka.flush_interval {
@@ -940,11 +988,18 @@ func runEFTLoader() {
 			// Prometheus Metrics
 			//
 			// // increment a counter for number of requests processed, we can use this number with time to create a throughput graph
-			m.req_processed.WithLabelValues("nrt_eft").Inc()
+
+			m.req_processed.WithLabelValues("eft").Inc()
 
 			// // determine the duration and log to prometheus histogram, this is for the entire build of payload and post
-			m.api_duration.WithLabelValues("nrt_eft").Observe(time.Since(txnStart).Seconds())
+			m.rec_duration.WithLabelValues("eft").Observe(time.Since(txnStart).Seconds())
+			//fmt.Printf("rec_duration Execution time: %.6f s\n", time.Since(txnStart).Seconds())
 
+			// Add is used here rather than Push to not delete a previously pushed
+			// success timestamp in case of a failure of this backup.
+			if err := pusher.Add(); err != nil {
+				fmt.Println("Could not push to Pushgateway:", err)
+			}
 			vFlush++
 
 		}
@@ -989,23 +1044,37 @@ func runEFTLoader() {
 		defer p.Close()
 
 	}
+
+	//m.duration.With(prometheus.Labels{"batch": "eft"}).Observe(time.Since(batchStartTime).Seconds())
+	m.duration.WithLabelValues("eft").Observe(time.Since(batchStartTime).Seconds())
+
+	//m.completionTime.With(prometheus.Labels{"batch": "eft"}).SetToCurrentTime()
+	m.completionTime.WithLabelValues("eft").SetToCurrentTime()
+
+	// Add is used here rather than Push to not delete a previously pushed
+	// success timestamp in case of a failure of this backup.
+	if err := pusher.Add(); err != nil {
+		fmt.Println("Could not push to Pushgateway:", err)
+	}
+
 	os.Exit(0)
 
 }
 
 func main() {
 
-	pMux := http.NewServeMux()
-	promHandler := promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
-	pMux.Handle("/metrics", promHandler)
+	//	pMux := http.NewServeMux()
+	//	promHandler := promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
+	//	pMux.Handle("/metrics", promHandler)
 
 	// Initialize Prometheus handler
 	grpcLog.Info("**** Starting ****")
 
-	go runEFTLoader()
+	runEFTLoader()
 
-	go func() {
-		fmt.Println(http.ListenAndServe(":9000", pMux))
-	}()
-	select {}
+	//	go func() {
+	//		fmt.Println(http.ListenAndServe(":9000", pMux))
+	//	}()
+	//
+	// select {}
 }
